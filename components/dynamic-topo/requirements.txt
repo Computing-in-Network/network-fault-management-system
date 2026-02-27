@@ -1,0 +1,6 @@
+skyfield
+numpy
+redis
+pytest
+pyproj
+websockets

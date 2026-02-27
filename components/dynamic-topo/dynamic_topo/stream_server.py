@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from dataclasses import asdict
+from time import perf_counter
+
+from .engine import SimulationConfig, TopologyEngine
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Dynamic topology websocket stream server")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--port", type=int, default=8765, help="Bind port")
+    parser.add_argument("--dt", type=float, default=1.0, help="Simulation tick seconds")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed")
+    parser.add_argument("--link-policy", default=None, help="Path to link policy JSON file")
+    parser.add_argument(
+        "--hot-reload-link-policy",
+        action="store_true",
+        help="Reload link policy file when it changes",
+    )
+    return parser.parse_args()
+
+
+def _control_error(action: str | None, request_id: str | None, message: str) -> dict:
+    return {
+        "type": "control_ack",
+        "ok": False,
+        "action": action,
+        "request_id": request_id,
+        "error": message,
+    }
+
+
+def _find_existing_fault(engine: TopologyEngine, fault_type: str, target: dict) -> dict | None:
+    for fault in engine.list_faults():
+        if fault.get("fault_type") != fault_type:
+            continue
+        if fault.get("target") == target:
+            return fault
+    return None
+
+
+def _handle_control_message(engine: TopologyEngine, payload: dict) -> dict:
+    action = payload.get("action")
+    request_id = payload.get("request_id")
+    if not isinstance(action, str) or not action:
+        return _control_error(None, request_id, "missing action")
+
+    try:
+        if action == "inject_node_fault":
+            node_id = payload.get("node_id")
+            if not isinstance(node_id, str) or not node_id:
+                return _control_error(action, request_id, "node_id is required")
+            target = {"node_id": node_id}
+            existing = _find_existing_fault(engine, "DAMAGED", target)
+            if existing is not None:
+                return {
+                    "type": "control_ack",
+                    "ok": True,
+                    "action": action,
+                    "request_id": request_id,
+                    "deduplicated": True,
+                    "fault": existing,
+                    "faults": engine.list_faults(),
+                }
+            fault_id = engine.inject_node_fault(node_id)
+            fault = next((f for f in engine.list_faults() if f["fault_id"] == fault_id), None)
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "deduplicated": False,
+                "fault": fault,
+                "faults": engine.list_faults(),
+            }
+
+        if action == "inject_link_fault":
+            a = payload.get("a")
+            b = payload.get("b")
+            if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+                return _control_error(action, request_id, "a and b are required")
+            if a == b:
+                return _control_error(action, request_id, "a and b must be different")
+            aa, bb = (a, b) if a < b else (b, a)
+            target = {"a": aa, "b": bb}
+            existing = _find_existing_fault(engine, "INTERRUPTED", target)
+            if existing is not None:
+                return {
+                    "type": "control_ack",
+                    "ok": True,
+                    "action": action,
+                    "request_id": request_id,
+                    "deduplicated": True,
+                    "fault": existing,
+                    "faults": engine.list_faults(),
+                }
+            fault_id = engine.inject_link_fault(a, b)
+            fault = next((f for f in engine.list_faults() if f["fault_id"] == fault_id), None)
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "deduplicated": False,
+                "fault": fault,
+                "faults": engine.list_faults(),
+            }
+
+        if action == "clear_fault":
+            fault_id = payload.get("fault_id")
+            if not isinstance(fault_id, str) or not fault_id:
+                return _control_error(action, request_id, "fault_id is required")
+            ok = engine.clear_fault(fault_id)
+            if not ok:
+                return _control_error(action, request_id, f"fault not found: {fault_id}")
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "faults": engine.list_faults(),
+            }
+
+        if action == "clear_all_faults":
+            engine.clear_all_faults()
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "faults": engine.list_faults(),
+            }
+
+        if action == "list_faults":
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "action": action,
+                "request_id": request_id,
+                "faults": engine.list_faults(),
+            }
+    except ValueError as exc:
+        return _control_error(action, request_id, str(exc))
+
+    return _control_error(action, request_id, f"unknown action: {action}")
+
+
+async def run_server(host: str, port: int, config: SimulationConfig, seed: int) -> None:
+    try:
+        from websockets.asyncio.server import serve
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("websockets package is required. Install deps with `uv sync --dev`.") from exc
+
+    engine = TopologyEngine(config=config, seed=seed)
+    clients: set = set()
+    redis_queue: asyncio.Queue[tuple[float, object, object]] = asyncio.Queue(maxsize=2)
+
+    async def handler(websocket):
+        clients.add(websocket)
+        try:
+            async for message in websocket:
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    response = _control_error(None, None, "invalid JSON payload")
+                else:
+                    if not isinstance(payload, dict):
+                        response = _control_error(None, None, "payload must be a JSON object")
+                    else:
+                        response = _handle_control_message(engine, payload)
+                await websocket.send(json.dumps(response, separators=(",", ":")))
+        finally:
+            clients.discard(websocket)
+
+    async def redis_writer() -> None:
+        while True:
+            sim_time, positions, adjacency = await redis_queue.get()
+            await asyncio.to_thread(engine.persist_state, sim_time, positions, adjacency)
+            redis_queue.task_done()
+
+    async def producer() -> None:
+        sim_time = 0.0
+        dt = config.timestep_s
+        next_deadline = perf_counter()
+        tick_count = 0
+        lag_ms_window: list[float] = []
+        compute_ms_window: list[float] = []
+        while True:
+            tick_start = perf_counter()
+            result = engine.step(sim_time, persist=False)
+            frame = engine.build_frame(result)
+            payload = json.dumps(asdict(frame), separators=(",", ":"))
+            if clients:
+                await asyncio.gather(*(ws.send(payload) for ws in list(clients)), return_exceptions=True)
+
+            # Decouple Redis I/O from compute loop: keep only latest states if writer lags.
+            if redis_queue.full():
+                try:
+                    _ = redis_queue.get_nowait()
+                    redis_queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+            await redis_queue.put((sim_time, result.node_positions_ecef, result.adjacency))
+
+            tick_count += 1
+            compute_ms_window.append(result.elapsed_ms)
+
+            next_deadline += dt
+            now = perf_counter()
+            lag_ms = max(0.0, (now - next_deadline) * 1000.0)
+            lag_ms_window.append(lag_ms)
+            sleep_s = next_deadline - now
+            if sleep_s > 0.0:
+                await asyncio.sleep(sleep_s)
+            else:
+                # If late, reset deadline to avoid accumulating drift.
+                next_deadline = perf_counter()
+
+            if tick_count % 10 == 0:
+                lag_sorted = sorted(lag_ms_window)
+                p95_idx = max(0, int(0.95 * (len(lag_sorted) - 1)))
+                p95_lag = lag_sorted[p95_idx]
+                avg_compute = sum(compute_ms_window) / max(1, len(compute_ms_window))
+                loop_ms = (perf_counter() - tick_start) * 1000.0
+                print(
+                    f"tick={tick_count} avg_compute={avg_compute:.2f}ms "
+                    f"loop={loop_ms:.2f}ms lag_p95={p95_lag:.2f}ms lag_max={max(lag_ms_window):.2f}ms"
+                )
+                lag_ms_window.clear()
+                compute_ms_window.clear()
+
+            sim_time += config.timestep_s
+
+    async with serve(handler, host, port, max_size=10_000_000):
+        print(f"ws://{host}:{port} serving topology stream, dt={config.timestep_s:.2f}s")
+        writer_task = asyncio.create_task(redis_writer())
+        try:
+            await producer()
+        finally:
+            writer_task.cancel()
+            await asyncio.gather(writer_task, return_exceptions=True)
+
+
+def main() -> None:
+    args = parse_args()
+    config = SimulationConfig(
+        timestep_s=args.dt,
+        link_policy_path=args.link_policy,
+        link_policy_hot_reload=args.hot_reload_link_policy,
+    )
+    asyncio.run(run_server(args.host, args.port, config=config, seed=args.seed))
+
+
+if __name__ == "__main__":
+    main()

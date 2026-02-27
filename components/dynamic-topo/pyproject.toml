@@ -1,0 +1,29 @@
+[project]
+name = "dynamic-topo"
+version = "0.3.0"
+description = "300-node dynamic topology simulation and Redis topology streaming"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyproj",
+    "redis",
+    "skyfield",
+    "websockets>=15.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dynamic_topo*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
